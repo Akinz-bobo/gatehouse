@@ -1,0 +1,44 @@
+# Local stack: Postgres, a one-off migration run, then the service with every module on.
+# KEY_ENCRYPTION_KEY below is public, so it protects nothing. Never use it anywhere else:
+# generate your own with `pnpm cli generate-key`.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gatehouse
+      POSTGRES_PASSWORD: gatehouse
+      POSTGRES_DB: gatehouse
+    ports:
+      - '5546:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U gatehouse -d gatehouse']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    command: ['node', 'dist/db/migrate.js']
+    environment:
+      DATABASE_URL: postgres://gatehouse:gatehouse@postgres:5432/gatehouse
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gatehouse:
+    build: .
+    environment:
+      DATABASE_URL: postgres://gatehouse:gatehouse@postgres:5432/gatehouse
+      ISSUER: http://localhost:4000
+      KEY_ENCRYPTION_KEY: P3e27UhotqGECJ4jI11Gj2hiP2rk2p3mVo39XCdc00M=
+      MODULES: ${MODULES:-rbac,abac,mfa,audit}
+    ports:
+      - '4000:4000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
