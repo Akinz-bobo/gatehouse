@@ -1,0 +1,1129 @@
+openapi: 3.0.3
+info:
+  title: Gatehouse
+  version: 0.1.0
+  license:
+    name: MIT
+  description: |
+    A modular authentication and authorization service.
+
+    The **core** is always on: accounts, password sign-in, short-lived ES256 access tokens,
+    rotating refresh tokens, sessions, password reset and a public JWKS endpoint.
+
+    Everything else is a **module** you switch on with the `MODULES` environment variable:
+    `rbac`, `abac`, `oauth`, `mfa` and `audit`. The endpoints of a module that is not enabled
+    do not exist and answer `404`. `GET /readyz` reports which modules are running.
+
+    ## Conventions
+
+    - Send the access token as `Authorization: Bearer <token>`.
+    - Every error has the same shape: `{ "error": { "code", "message", "details" } }`.
+      Branch on `code`, which is stable; `message` is for people.
+    - Request bodies are strict. Unknown fields are rejected with `400 validation_error`.
+    - Every response carries `x-request-id`. Quote it when reporting a problem.
+servers:
+  - url: http://localhost:4000
+    description: Local development
+tags:
+  - name: Authentication
+    description: Core. Accounts, sign-in and tokens.
+  - name: Sessions
+    description: Core. See and end the sessions of the signed-in user.
+  - name: Passwords
+    description: Core. Change and reset passwords.
+  - name: Keys
+    description: Core. Public verification keys and key rotation.
+  - name: Roles
+    description: Module `rbac`. Roles, permissions and permission checks.
+  - name: Policies
+    description: Module `abac`. Attribute-based policies and decisions.
+  - name: OAuth
+    description: Module `oauth`. Sign in with an external OAuth 2.0 or OpenID Connect provider.
+  - name: Two-factor
+    description: Module `mfa`. Time-based one-time passwords (TOTP) and recovery codes.
+  - name: Audit
+    description: Module `audit`. The append-only log of security events.
+  - name: Operations
+    description: Health and readiness probes.
+
+paths:
+  /healthz:
+    get:
+      tags: [Operations]
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        '200':
+          description: The process is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+  /readyz:
+    get:
+      tags: [Operations]
+      summary: Readiness probe
+      description: Checks the database and lists the enabled modules.
+      operationId: readyz
+      responses:
+        '200':
+          description: Ready to serve traffic.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, modules]
+                properties:
+                  status: { type: string, enum: [ready] }
+                  modules:
+                    type: array
+                    items: { type: string, enum: [rbac, abac, oauth, mfa, audit] }
+        '503':
+          description: The database is unreachable.
+  /.well-known/jwks.json:
+    get:
+      tags: [Keys]
+      summary: Public signing keys (JWKS)
+      description: |
+        The public keys that verify access tokens. Resource servers fetch this, cache it,
+        and verify tokens locally without calling Gatehouse on each request. After a
+        rotation the retired key stays here until every token it signed has expired.
+      operationId: getJwks
+      responses:
+        '200':
+          description: A JSON Web Key Set. Contains public keys only.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      required: [kty, crv, x, y, kid, alg, use]
+                      properties:
+                        kty: { type: string, example: EC }
+                        crv: { type: string, example: P-256 }
+                        x: { type: string }
+                        y: { type: string }
+                        kid: { type: string }
+                        alg: { type: string, example: ES256 }
+                        use: { type: string, example: sig }
+
+  /v1/auth/register:
+    post:
+      tags: [Authentication]
+      summary: Create an account
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '201':
+          description: The account was created. Sign in to get tokens.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409':
+          description: '`email_taken`: an account with this email already exists.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`weak_password`: the password does not meet the policy.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Sign in with email and password
+      description: |
+        Returns tokens, or, when the user has a second factor enabled (module `mfa`), a
+        short-lived `mfaToken` to finish the sign-in with at `POST /v1/auth/mfa/verify`.
+
+        A wrong password, an unknown email, a locked account and a disabled account all
+        get the same `401`, so the response cannot be used to probe for accounts.
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '200':
+          description: Signed in, or a second factor is required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignInResult' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: '`invalid_credentials`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Trade a refresh token for a new token pair
+      description: |
+        Refresh tokens are single-use. Each call returns a new one and retires the old.
+        Presenting a retired token means it was copied, so the whole session is ended and
+        both parties have to sign in again (`refresh_token_reused`).
+      operationId: refresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: A new token pair.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: '`invalid_refresh_token` or `refresh_token_reused`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: End the current session
+      description: The access token stops working immediately, not when it expires.
+      operationId: logout
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204': { description: Signed out. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+  /v1/auth/me:
+    get:
+      tags: [Authentication]
+      summary: The signed-in user
+      operationId: me
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The user, and the claims modules add to their tokens.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, claims]
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  claims:
+                    type: object
+                    additionalProperties: true
+                    description: With `rbac` enabled, contains `roles` and `permissions`.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /v1/auth/sessions:
+    get:
+      tags: [Sessions]
+      summary: List the signed-in user's sessions
+      operationId: listSessions
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Active sessions, with the current one marked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+  /v1/auth/sessions/{id}:
+    delete:
+      tags: [Sessions]
+      summary: End one of your sessions
+      operationId: revokeSession
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: The session was ended. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/auth/password/change:
+    post:
+      tags: [Passwords]
+      summary: Change the signed-in user's password
+      description: Requires the current password. Every other session is signed out.
+      operationId: changePassword
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string }
+                newPassword: { type: string }
+      responses:
+        '204': { description: The password was changed. }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: '`unauthenticated`, or `invalid_credentials` for a wrong current password.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`weak_password`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/auth/password/reset-request:
+    post:
+      tags: [Passwords]
+      summary: Ask for a password reset
+      description: |
+        Always answers `202`, whether or not the address has an account. If it does, a
+        one-time token is handed to the configured notifier for delivery.
+      operationId: requestPasswordReset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '202':
+          description: Accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [accepted] }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/auth/password/reset:
+    post:
+      tags: [Passwords]
+      summary: Set a new password with a reset token
+      description: The token works once. Every session of the account is ended.
+      operationId: resetPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, newPassword]
+              properties:
+                token: { type: string }
+                newPassword: { type: string }
+      responses:
+        '204': { description: The password was reset. }
+        '400':
+          description: '`invalid_token` (unknown, used or expired) or `validation_error`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`weak_password`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/admin/keys/rotate:
+    post:
+      tags: [Keys]
+      summary: Rotate the signing key
+      description: |
+        Creates a new signing key and retires the current one. Tokens already issued keep
+        verifying until they expire. Requires a superuser or the `auth:keys:rotate` permission.
+      operationId: rotateKeys
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The id of the new signing key.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [kid]
+                properties:
+                  kid: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/roles:
+    get:
+      tags: [Roles]
+      summary: List roles
+      description: Requires `auth:roles:manage`.
+      operationId: listRoles
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Every role with its permissions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roles]
+                properties:
+                  roles:
+                    type: array
+                    items: { $ref: '#/components/schemas/Role' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/roles/{name}:
+    parameters:
+      - $ref: '#/components/parameters/RoleName'
+    put:
+      tags: [Roles]
+      summary: Create or replace a role
+      description: |
+        Requires `auth:roles:manage`. Permissions look like `invoices:read`. A trailing
+        wildcard such as `invoices:*` grants everything under that prefix.
+      operationId: putRole
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [permissions]
+              properties:
+                description: { type: string, nullable: true, maxLength: 500 }
+                permissions:
+                  type: array
+                  maxItems: 200
+                  items: { type: string, example: 'invoices:read' }
+      responses:
+        '200':
+          description: The saved role.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Role' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Roles]
+      summary: Delete a role
+      description: Requires `auth:roles:manage`. Everyone who held the role loses it at once.
+      operationId: deleteRole
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/users/{userId}/roles:
+    get:
+      tags: [Roles]
+      summary: A user's roles and effective permissions
+      description: Requires `auth:roles:manage`.
+      operationId: getUserRoles
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Roles and the union of their permissions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Access' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/users/{userId}/roles/{name}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/RoleName'
+    put:
+      tags: [Roles]
+      summary: Give a user a role
+      description: Requires `auth:roles:manage`. Safe to repeat.
+      operationId: assignRole
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204': { description: Assigned. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Roles]
+      summary: Take a role away from a user
+      description: Requires `auth:roles:manage`. Safe to repeat.
+      operationId: removeRole
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204': { description: Removed. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/authz/check:
+    post:
+      tags: [Roles]
+      summary: Does the signed-in user have a permission?
+      description: |
+        Answered from the database, so a role removed a second ago is already gone. Use it
+        when a decision must not rely on claims that could be up to one token lifetime old.
+      operationId: checkPermission
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [permission]
+              properties:
+                permission: { type: string, example: 'invoices:write' }
+      responses:
+        '200':
+          description: The answer.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [allowed]
+                properties:
+                  allowed: { type: boolean }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /v1/policies:
+    get:
+      tags: [Policies]
+      summary: List policies
+      description: Requires `auth:policies:manage`.
+      operationId: listPolicies
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Every policy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [policies]
+                properties:
+                  policies:
+                    type: array
+                    items: { $ref: '#/components/schemas/Policy' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Policies]
+      summary: Create a policy
+      description: Requires `auth:policies:manage`.
+      operationId: createPolicy
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyInput' }
+            example:
+              name: owners edit their documents
+              effect: allow
+              actions: ['documents:update']
+              resources: [document]
+              condition:
+                eq: [{ var: resource.ownerId }, { var: subject.id }]
+      responses:
+        '201':
+          description: The created policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /v1/policies/{id}:
+    delete:
+      tags: [Policies]
+      summary: Delete a policy
+      description: Requires `auth:policies:manage`.
+      operationId: deletePolicy
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/authz/evaluate:
+    post:
+      tags: [Policies]
+      summary: May the signed-in user do this action to this resource?
+      description: |
+        Evaluates every policy. An explicit deny always wins; with no matching allow the
+        answer is no. The subject is built from the verified token (id, email, attributes
+        and, with `rbac`, roles) and cannot be supplied in the request.
+      operationId: evaluatePolicies
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [action, resource]
+              properties:
+                action: { type: string, example: 'documents:update' }
+                resource:
+                  type: object
+                  required: [type]
+                  additionalProperties: true
+                  properties:
+                    type: { type: string, example: document }
+                context:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: The decision and the policies behind it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Decision' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /v1/oauth/providers:
+    get:
+      tags: [OAuth]
+      summary: List configured providers
+      operationId: listOAuthProviders
+      responses:
+        '200':
+          description: Provider ids. Never includes client secrets.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items: { type: string }
+  /v1/oauth/{provider}/start:
+    get:
+      tags: [OAuth]
+      summary: Start a sign-in with a provider
+      description: |
+        Send the browser here. It is redirected to the provider with a single-use `state`
+        and a PKCE challenge. `redirect_uri` is where the browser lands afterwards and must
+        match an entry in `OAUTH_REDIRECT_ALLOWLIST` exactly.
+      operationId: startOAuth
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+        - name: redirect_uri
+          in: query
+          required: true
+          schema: { type: string, format: uri }
+      responses:
+        '302': { description: Redirect to the provider. }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: '`redirect_not_allowed`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/oauth/{provider}/link:
+    post:
+      tags: [OAuth]
+      summary: Link a provider to the signed-in user
+      description: |
+        Returns the provider URL to navigate to. This is the only way a provider identity
+        is attached to an existing account: accounts are never merged just because the
+        emails match.
+      operationId: linkOAuth
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [redirect_uri]
+              properties:
+                redirect_uri: { type: string, format: uri }
+      responses:
+        '200':
+          description: Where to send the browser.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url]
+                properties:
+                  url: { type: string, format: uri }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: '`redirect_not_allowed`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/oauth/{provider}/callback:
+    get:
+      tags: [OAuth]
+      summary: Provider callback
+      description: |
+        The provider sends the browser here. Register this URL with the provider. The
+        browser is redirected to the original `redirect_uri` with either `?code=`, a
+        one-time code valid for 60 seconds, or `?error=`. Tokens are never put in a URL.
+      operationId: oauthCallback
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+        - { name: code, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        '302': { description: Redirect back to the client application. }
+        '400':
+          description: '`invalid_token`: the state is unknown, already used or expired.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/oauth/exchange:
+    post:
+      tags: [OAuth]
+      summary: Trade the one-time code for tokens
+      operationId: exchangeOAuthCode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        '200':
+          description: Signed in, or a second factor is required.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignInResult' }
+        '400':
+          description: '`invalid_token`: the code is unknown, already used or expired.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/mfa:
+    get:
+      tags: [Two-factor]
+      summary: Two-factor status of the signed-in user
+      operationId: getMfaStatus
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Which factors are enabled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [totp]
+                properties:
+                  totp: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+  /v1/mfa/totp/enroll:
+    post:
+      tags: [Two-factor]
+      summary: Begin TOTP enrolment
+      description: |
+        Returns a secret and an `otpauth://` URI to show as a QR code. Nothing is enforced
+        until a code is confirmed, so an abandoned setup cannot lock anyone out.
+      operationId: enrollTotp
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The secret, shown this once.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [secret, uri]
+                properties:
+                  secret: { type: string, description: Base32. }
+                  uri: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '409':
+          description: '`mfa_already_enabled`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/mfa/totp/confirm:
+    post:
+      tags: [Two-factor]
+      summary: Confirm enrolment with a code
+      operationId: confirmTotp
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TotpCode' }
+      responses:
+        '200':
+          description: Two-factor is on. The recovery codes are shown this once.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recoveryCodes]
+                properties:
+                  recoveryCodes:
+                    type: array
+                    items: { type: string }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422':
+          description: '`invalid_mfa_code`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/mfa/totp/disable:
+    post:
+      tags: [Two-factor]
+      summary: Turn TOTP off
+      description: Requires a current code, so a stolen access token alone cannot remove it.
+      operationId: disableTotp
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TotpCode' }
+      responses:
+        '204': { description: Two-factor is off. }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '422':
+          description: '`invalid_mfa_code`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/auth/mfa/verify:
+    post:
+      tags: [Two-factor]
+      summary: Finish a sign-in with a second factor
+      description: |
+        Send the `mfaToken` from the first step with either a six-digit `code` or a
+        `recoveryCode`, not both. Each TOTP code and each recovery code works once.
+      operationId: verifyMfa
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [mfaToken]
+              properties:
+                mfaToken: { type: string }
+                code: { type: string, pattern: '^\d{6}$' }
+                recoveryCode: { type: string }
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SignInResult' }
+        '400':
+          description: '`invalid_token` for a bad or expired MFA token, or `validation_error`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`invalid_mfa_code`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/audit:
+    get:
+      tags: [Audit]
+      summary: Read the audit log
+      description: Newest first. Requires `auth:audit:read`.
+      operationId: listAudit
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: before
+          in: query
+          description: The `nextCursor` of the previous page.
+          schema: { type: string }
+        - name: type
+          in: query
+          description: An event type, such as `login.failed`.
+          schema: { type: string }
+        - name: actorId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: One page of entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries, nextCursor]
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEntry' }
+                  nextCursor: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: An access token from sign-in or refresh.
+  parameters:
+    RoleName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[a-z][a-z0-9_-]*$', maxLength: 64 }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Provider:
+      name: provider
+      in: path
+      required: true
+      description: A provider id from `OAUTH_PROVIDERS`.
+      schema: { type: string }
+  responses:
+    ValidationError:
+      description: '`validation_error`: the request is malformed. `details.issues` lists why.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthenticated:
+      description: '`unauthenticated`: the access token is missing, invalid, expired or its session has ended.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: '`forbidden`: signed in, but without the permission named in `details.permission`.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: '`not_found`'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: '`rate_limited`: too many requests. Retry after the `retry-after` header.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: invalid_credentials }
+            message: { type: string }
+            details: { type: object, additionalProperties: true }
+    Credentials:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string }
+    User:
+      type: object
+      required: [id, email, isSuperuser, attributes, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        isSuperuser: { type: boolean }
+        attributes:
+          type: object
+          additionalProperties: true
+          description: Free-form attributes that `abac` policies can test.
+        createdAt: { type: string, format: date-time }
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken, tokenType, expiresIn]
+      properties:
+        accessToken: { type: string, description: An ES256 JWT. }
+        refreshToken: { type: string, description: Opaque and single-use. }
+        tokenType: { type: string, enum: [Bearer] }
+        expiresIn: { type: integer, description: Seconds until the access token expires. }
+    SignInResult:
+      oneOf:
+        - allOf:
+            - $ref: '#/components/schemas/TokenPair'
+            - type: object
+              required: [mfaRequired]
+              properties:
+                mfaRequired: { type: boolean, enum: [false] }
+        - type: object
+          required: [mfaRequired, mfaToken, methods]
+          properties:
+            mfaRequired: { type: boolean, enum: [true] }
+            mfaToken: { type: string, description: Valid for five minutes and for nothing else. }
+            methods:
+              type: array
+              items: { type: string, example: totp }
+    Session:
+      type: object
+      required: [id, authMethod, createdAt, lastUsedAt, current]
+      properties:
+        id: { type: string, format: uuid }
+        authMethod: { type: string, example: password+totp }
+        ip: { type: string, nullable: true }
+        userAgent: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        lastUsedAt: { type: string, format: date-time }
+        current: { type: boolean }
+    Role:
+      type: object
+      required: [name, permissions]
+      properties:
+        name: { type: string }
+        description: { type: string, nullable: true }
+        permissions:
+          type: array
+          items: { type: string }
+    Access:
+      type: object
+      required: [roles, permissions]
+      properties:
+        roles: { type: array, items: { type: string } }
+        permissions: { type: array, items: { type: string } }
+    Condition:
+      type: object
+      description: |
+        One operator per object: `all`, `any`, `not`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`,
+        `in`, `contains` or `exists`. Operands are literals or references such as
+        `{ "var": "resource.ownerId" }`, rooted at `subject`, `resource` or `context`.
+      additionalProperties: true
+    PolicyInput:
+      type: object
+      additionalProperties: false
+      required: [name, effect, actions, resources]
+      properties:
+        name: { type: string, maxLength: 100 }
+        description: { type: string, maxLength: 500 }
+        effect: { type: string, enum: [allow, deny] }
+        actions:
+          type: array
+          items: { type: string, example: 'documents:*' }
+        resources:
+          type: array
+          items: { type: string, example: document }
+        condition:
+          nullable: true
+          allOf: [{ $ref: '#/components/schemas/Condition' }]
+    Policy:
+      allOf:
+        - $ref: '#/components/schemas/PolicyInput'
+        - type: object
+          required: [id]
+          properties:
+            id: { type: string, format: uuid }
+    Decision:
+      type: object
+      required: [allowed, reason, policies]
+      properties:
+        allowed: { type: boolean }
+        reason: { type: string, enum: [denied_by_policy, allowed_by_policy, no_matching_policy] }
+        policies:
+          type: array
+          description: The names of the policies that decided the outcome.
+          items: { type: string }
+    TotpCode:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code: { type: string, pattern: '^\d{6}$' }
+    AuditEntry:
+      type: object
+      required: [id, type, details, createdAt]
+      properties:
+        id: { type: string }
+        type: { type: string, example: login.failed }
+        actorId: { type: string, format: uuid, nullable: true }
+        subjectId: { type: string, nullable: true }
+        ip: { type: string, nullable: true }
+        userAgent: { type: string, nullable: true }
+        details: { type: object, additionalProperties: true }
+        createdAt: { type: string, format: date-time }
